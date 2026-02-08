@@ -3,3 +3,7 @@
 # azure-monitor-opentelemetry 
 
 azure-functions
+azure-identity==1.17.1
+azure-storage-file-datalake==12.15.0
+jsonschema>=4.22.0
+PyYAML>=6.0.1
