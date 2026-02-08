@@ -8,6 +8,8 @@ from typing import Any, Dict
 import azure.functions as func
 from azure.identity import DefaultAzureCredential
 from azure.storage.filedatalake import DataLakeServiceClient
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
 from lrg.common.contract import load_contract, validate_record
 from lrg.ingest.csv.row_to_canonical import CsvRow, to_canonical
