@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lab_result_record.v1.json",
+  "title": "Canonical Lab Result Record (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tenant", "result", "test", "source", "provenance"],
+  "properties": {
+    "tenant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id", "environment"],
+      "properties": {
+        "tenant_id": { "type": "string", "minLength": 1 },
+        "workspace_id": { "type": "string" },
+        "environment": { "type": "string", "enum": ["dev", "test", "prod"] }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result_id", "patient_id", "effective_time", "value", "unit"],
+      "properties": {
+        "result_id": { "type": "string", "minLength": 1 },
+        "patient_id": { "type": "string", "minLength": 1 },
+        "effective_time": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["timestamp", "time_type"],
+          "properties": {
+            "timestamp": { "type": "string", "format": "date-time" },
+            "time_type": { "type": "string", "enum": ["specimen_collected", "result_reported", "unknown"] }
+          }
+        },
+        "value": { "type": ["number", "string"] },
+        "unit": { "type": "string" },
+        "reported_flag": { "type": "string", "enum": ["H", "L", "N", "A", "U", "unknown"] },
+        "reference_range": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "low": { "type": "number" },
+            "high": { "type": "number" },
+            "text": { "type": "string" },
+            "unit": { "type": "string" }
+          }
+        }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_code", "local_name"],
+      "properties": {
+        "local_code": { "type": "string" },
+        "local_name": { "type": "string" },
+        "canonical_test_id": { "type": "string" },
+        "loinc": { "type": "string" },
+        "specimen_type": { "type": "string" },
+        "method": { "type": "string" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_type", "source_system_id"],
+      "properties": {
+        "source_type": { "type": "string", "enum": ["FHIR", "HL7V2_ORU", "CSV"] },
+        "source_system_id": { "type": "string" },
+        "performing_lab_id": { "type": "string" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_pointer", "field_lineage"],
+      "properties": {
+        "raw_pointer": { "type": "string", "description": "Pointer/path to stored raw payload (tenant-scoped)" },
+        "field_lineage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["value", "unit", "reference_range", "reported_flag"],
+          "properties": {
+            "value": { "type": "string", "enum": ["RECEIVED", "DERIVED"] },
+            "unit": { "type": "string", "enum": ["RECEIVED", "DERIVED"] },
+            "reference_range": { "type": "string", "enum": ["RECEIVED", "DERIVED", "MISSING"] },
+            "reported_flag": { "type": "string", "enum": ["RECEIVED", "DERIVED", "MISSING"] }
+          }
+        },
+        "mapping_version": { "type": "string" },
+        "rules_version": { "type": "string" }
+      }
+    }
+  }
+}
