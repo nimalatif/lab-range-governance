@@ -1,18 +1,14 @@
 import json
 import os
-from pathlib import Path
-
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict
 
 import azure.functions as func
-from azure.identity import DefaultAzureCredential
-from azure.storage.filedatalake import DataLakeServiceClient
-import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
-from lrg.common.contract import load_contract, validate_record
-from lrg.ingest.csv.row_to_canonical import CsvRow, to_canonical
+# Make src/ importable on Azure (repo uses src/ layout)
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -22,15 +18,21 @@ def _utc_path_date() -> str:
     return f"{now.year:04d}/{now.month:02d}/{now.day:02d}"
 
 
-def _datalake_client(account: str) -> DataLakeServiceClient:
+def _datalake_client(account: str):
+    from azure.identity import DefaultAzureCredential
+    from azure.storage.filedatalake import DataLakeServiceClient
+
     url = f"https://{account}.dfs.core.windows.net"
-    cred = DefaultAzureCredential()
-    return DataLakeServiceClient(account_url=url, credential=cred)
+    return DataLakeServiceClient(account_url=url, credential=DefaultAzureCredential())
 
 
 @app.route(route="ingest/csv", methods=["POST"])
 def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        # Import inside handler so app can register routes even if something is misconfigured
+        from lrg.common.contract import load_contract, validate_record
+        from lrg.ingest.csv.row_to_canonical import CsvRow, to_canonical
+
         payload = req.get_json()
         if not isinstance(payload, dict):
             raise ValueError("Body must be a JSON object")
@@ -40,7 +42,6 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         if not tenant_id:
             raise ValueError("TENANT_ID app setting is required")
 
-        # Minimal CSV row input contract (v1)
         row = CsvRow(
             tenant_id=tenant_id,
             patient_id=str(payload["patient_id"]),
@@ -55,19 +56,17 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
             ref_low=payload.get("ref_low"),
             ref_high=payload.get("ref_high"),
             ref_text=payload.get("ref_text"),
-            reported_flag=payload.get("reported_flag")
+            reported_flag=payload.get("reported_flag"),
         )
 
         record: Dict[str, Any] = to_canonical(row=row, environment=env, rules_version="v1", mapping_version="v1")
 
-        # Validate against canonical JSON schema
-        repo_root = os.path.dirname(__file__)
-        validator = load_contract(Path(repo_root).resolve())
+        validator = load_contract(Path(__file__).resolve().parent)
         validate_record(validator, record)
 
-        # Write to ADLS Gen2
         account = os.environ["DATALAKE_ACCOUNT"]
         container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
+
         dl = _datalake_client(account)
         fs = dl.get_file_system_client(container)
 
@@ -80,4 +79,14 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         file_client.upload_data(body, overwrite=True)
 
         return func.HttpResponse(
-            json.dumps({"status":
+            json.dumps({"status": "ok", "written_to": f"{container}/{file_path}"}),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=400,
+            mimetype="application/json",
+        )
