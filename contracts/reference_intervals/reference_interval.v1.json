@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lrg.reference_interval.v1",
+  "title": "ReferenceInterval (v1)",
+  "type": "object",
+  "required": [
+    "interval_id",
+    "analyte_code",
+    "unit",
+    "specimen_type",
+    "age_bucket",
+    "sex",
+    "performing_lab_id",
+    "policy_version",
+    "valid_from_utc",
+    "range"
+  ],
+  "properties": {
+    "interval_id": { "type": "string", "minLength": 1 },
+    "analyte_code": { "type": "string", "minLength": 1 },
+    "unit": { "type": "string", "minLength": 1 },
+    "specimen_type": { "type": "string", "minLength": 1 },
+    "age_bucket": { "type": "string", "minLength": 1 },
+    "sex": { "type": "string", "enum": ["male", "female", "other", "unknown"] },
+    "pregnancy_status": { "type": "string", "enum": ["pregnant", "not_pregnant", "unknown"], "default": "unknown" },
+
+    "performing_lab_id": { "type": "string", "minLength": 1 },
+    "policy_version": { "type": "string", "minLength": 1 },
+
+    "assay_method": { "type": "string" },
+    "instrument_id": { "type": "string" },
+    "instrument_model": { "type": "string" },
+
+    "valid_from_utc": { "type": "string", "format": "date-time" },
+    "valid_to_utc": { "type": ["string", "null"], "format": "date-time" },
+
+    "range": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "enum": ["numeric", "text"] },
+
+        "low": { "type": ["number", "null"] },
+        "high": { "type": ["number", "null"] },
+
+        "low_inclusive": { "type": "boolean", "default": true },
+        "high_inclusive": { "type": "boolean", "default": true },
+
+        "text": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "source": { "type": "string" },
+        "notes": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}
