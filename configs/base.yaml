@@ -1,0 +1,30 @@
+project:
+  name: lab-range-governance
+  canonical_contract: contracts/canonical/lab_result_record.v1.json
+  rules_version: v1
+  mapping_version: v1
+
+tenancy:
+  strict_isolation: true
+  tenant_id_env: TENANT_ID
+  workspace_id_env: WORKSPACE_ID
+  environment_env: ENV
+
+storage:
+  raw:
+    path_template: "tenants/{tenant_id}/raw/{source_type}/"
+  canonical:
+    path_template: "tenants/{tenant_id}/canonical/lab_results/"
+  derived:
+    path_template: "tenants/{tenant_id}/derived/"
+
+authority:
+  preserve_reported_reference_range: true
+  preserve_reported_flag: true
+  allow_unit_conversion: true
+  unit_conversion_policy: "ucum_only"
+
+quality:
+  require_patient_id: true
+  require_effective_time: true
+  allow_textual_reference_range: true
