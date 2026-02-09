@@ -107,12 +107,116 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         body = json.dumps(record, ensure_ascii=False).encode("utf-8")
         file_client.upload_data(body, overwrite=True)
 
+
+                # --- Derived interpretation (Gold / AI-ready) ---
+        from lrg.governance.runbook_loader import load_reference_intervals_from_adls
+        from lrg.governance.reference_intervals import select_interval
+
+        ctx = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        specimen_type = str(ctx.get("specimen_type", "serum"))
+        age_bucket = str(ctx.get("age_bucket", "adult"))
+        sex = str(ctx.get("sex", "male"))
+        performing_lab_id = str(ctx.get("performing_lab_id", payload.get("performing_lab_id", "LAB_A")))
+        policy_version = str(ctx.get("policy_version", "v1"))
+
+        # analyte_code: allow direct override; else map common local codes -> LOINC (v1 minimal)
+        analyte_code = None
+        if isinstance(payload.get("analyte_code"), str) and payload["analyte_code"].strip():
+            analyte_code = payload["analyte_code"].strip()
+        elif isinstance(payload.get("loinc_code"), str) and payload["loinc_code"].strip():
+            analyte_code = f"loinc:{payload['loinc_code'].strip()}"
+        else:
+            tc = str(payload.get("test_code", "")).strip().upper()
+            local_to_loinc_v1 = {"GLU": "2345-7"}
+            if tc in local_to_loinc_v1:
+                analyte_code = f"loinc:{local_to_loinc_v1[tc]}"
+
+        observation_time_utc = str(payload.get("timestamp_iso", "")).strip()
+        if not observation_time_utc:
+            observation_time_utc = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        value = record.get("result", {}).get("value", None)
+        unit = record.get("result", {}).get("unit", None)
+
+        derived_container = os.getenv("STORAGE_DERIVED_CONTAINER", "derived")
+        fs_derived = dl.get_file_system_client(derived_container)
+
+        interpretation = {
+            "computed_flag": "U",
+            "interval_id": None,
+            "computed_by": "lrg.governance.v1",
+            "computed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+
+        if analyte_code and unit is not None and value is not None:
+            runbooks_container = os.getenv("STORAGE_RUNBOOKS_CONTAINER", "runbooks")
+            intervals = load_reference_intervals_from_adls(
+                account=account,
+                container=runbooks_container,
+                tenant_id=tenant_id,
+            )
+
+            it = select_interval(
+                intervals,
+                analyte_code=str(analyte_code),
+                unit=str(unit),
+                specimen_type=str(specimen_type),
+                age_bucket=str(age_bucket),
+                sex=str(sex),
+                performing_lab_id=str(performing_lab_id),
+                policy_version=str(policy_version),
+                observation_time_utc=str(observation_time_utc),
+            )
+
+            if it and isinstance(it.range, dict) and it.range.get("type") == "numeric":
+                low = it.range.get("low")
+                high = it.range.get("high")
+                if isinstance(low, (int, float)) and isinstance(high, (int, float)) and isinstance(value, (int, float)):
+                    if value < low:
+                        interpretation["computed_flag"] = "L"
+                    elif value > high:
+                        interpretation["computed_flag"] = "H"
+                    else:
+                        interpretation["computed_flag"] = "N"
+                    interpretation["interval_id"] = it.interval_id
+
+        derived_record = {
+            "tenant_id": tenant_id,
+            "result_id": record["result"]["result_id"],
+            "analyte_code": analyte_code,
+            "unit": unit,
+            "value": value,
+            "observation_time_utc": observation_time_utc,
+            "context": {
+                "specimen_type": specimen_type,
+                "age_bucket": age_bucket,
+                "sex": sex,
+                "performing_lab_id": performing_lab_id,
+                "policy_version": policy_version,
+            },
+            "interpretation": interpretation,
+            "source": {
+                "raw_path": f"{raw_container}/{raw_path}",
+                "canonical_path": f"{container}/{file_path}",
+            },
+        }
+
+        derived_prefix = f"tenants/{tenant_id}/lab_results_interpreted/{date_path}"
+        derived_file_path = f"{derived_prefix}/{record['result']['result_id']}.json"
+        der_file_client = fs_derived.get_file_client(derived_file_path)
+        der_body = json.dumps(derived_record, ensure_ascii=False).encode("utf-8")
+        der_file_client.upload_data(der_body, overwrite=True)
+
+
         return func.HttpResponse(
-            json.dumps(
+                        json.dumps(
                 {
                     "status": "ok",
                     "raw_written_to": f"{raw_container}/{raw_path}",
-                    "written_to": f"{canonical_container}/{canonical_file_path}",
+                    "written_to": f"{container}/{file_path}",
+                    "derived_written_to": f"{derived_container}/{derived_file_path}",
+                    "computed_flag": interpretation["computed_flag"],
+                    "interval_id": interpretation["interval_id"],
                 }
             ),
             status_code=200,
