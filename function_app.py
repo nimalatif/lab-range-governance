@@ -7,7 +7,6 @@ from typing import Any, Dict
 
 import azure.functions as func
 
-# Make src/ importable on Azure (repo uses src/ layout)
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -17,16 +16,26 @@ def _utc_path_date() -> str:
     now = datetime.now(timezone.utc)
     return f"{now.year:04d}/{now.month:02d}/{now.day:02d}"
 
-def _write_raw_event(dl, *, container: str, tenant_id: str, event_id: str, payload: dict, event_type: str) -> str:
+
+def _write_raw_event(
+    dl,
+    *,
+    container: str,
+    tenant_id: str,
+    event_id: str,
+    payload: dict,
+    event_type: str,
+) -> str:
     fs = dl.get_file_system_client(container)
     date_path = _utc_path_date()
-    file_path = f"tenants/{tenant_id}/ingest_events/{date_path}/{event_id}.json"
+    file_path = f"tenants/{tenant_id}/ingest_events/{event_type}/{date_path}/{event_id}.json"
     body = json.dumps(
         {"event_type": event_type, "payload": payload},
         ensure_ascii=False,
     ).encode("utf-8")
     fs.get_file_client(file_path).upload_data(body, overwrite=True)
     return file_path
+
 
 def _datalake_client(account: str):
     from azure.identity import DefaultAzureCredential
@@ -39,7 +48,6 @@ def _datalake_client(account: str):
 @app.route(route="ingest/csv", methods=["POST"])
 def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        # Import inside handler so app can register routes even if something is misconfigured
         from lrg.common.contract import load_contract, validate_record
         from lrg.ingest.csv.row_to_canonical import CsvRow, to_canonical
 
@@ -75,9 +83,10 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         validate_record(validator, record)
 
         account = os.environ["DATALAKE_ACCOUNT"]
-        container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
+        canonical_container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
 
         dl = _datalake_client(account)
+
         raw_container = os.getenv("STORAGE_RAW_CONTAINER", "raw")
         raw_path = _write_raw_event(
             dl,
@@ -88,13 +97,13 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
             event_type="ingest_csv",
         )
 
-        fs = dl.get_file_system_client(container)
+        fs = dl.get_file_system_client(canonical_container)
 
         date_path = _utc_path_date()
         tenant_prefix = f"tenants/{tenant_id}/lab_results/{date_path}"
-        file_path = f"{tenant_prefix}/{record['result']['result_id']}.json"
+        canonical_file_path = f"{tenant_prefix}/{record['result']['result_id']}.json"
 
-        file_client = fs.get_file_client(file_path)
+        file_client = fs.get_file_client(canonical_file_path)
         body = json.dumps(record, ensure_ascii=False).encode("utf-8")
         file_client.upload_data(body, overwrite=True)
 
@@ -103,13 +112,12 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
                 {
                     "status": "ok",
                     "raw_written_to": f"{raw_container}/{raw_path}",
-                    "written_to": f"{container}/{file_path}",
+                    "written_to": f"{canonical_container}/{canonical_file_path}",
                 }
             ),
             status_code=200,
             mimetype="application/json",
         )
-
 
     except Exception as e:
         return func.HttpResponse(
@@ -117,6 +125,8 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
             mimetype="application/json",
         )
+
+
 @app.route(route="ingest/fhir", methods=["POST"])
 def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -141,12 +151,12 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         if not isinstance(obs_json, dict):
             raise ValueError("Missing 'observation' object (FHIR Observation JSON)")
 
-        # Canonicalize (contract-bound)
         obs = FhirObservation(
             tenant_id=tenant_id,
             source_system_id=source_system_id,
             observation_json=obs_json
         )
+
         record: Dict[str, Any] = to_canonical(
             obs, environment=env, rules_version="v1", mapping_version="v1"
         )
@@ -154,11 +164,11 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         validator = load_contract(Path(__file__).resolve().parent)
         validate_record(validator, record)
 
-        # Write canonical
         account = os.environ["DATALAKE_ACCOUNT"]
         canonical_container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
 
         dl = _datalake_client(account)
+
         raw_container = os.getenv("STORAGE_RAW_CONTAINER", "raw")
         raw_path = _write_raw_event(
             dl,
@@ -167,7 +177,7 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
             event_id=record["result"]["result_id"],
             payload=payload,
             event_type="ingest_fhir",
-            )
+        )
 
         fs_canon = dl.get_file_system_client(canonical_container)
 
@@ -179,8 +189,6 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         canon_body = json.dumps(record, ensure_ascii=False).encode("utf-8")
         canon_file_client.upload_data(canon_body, overwrite=True)
 
-        # --- Derived interpretation (semantic / AI-ready layer) ---
-        # Defaults (can be overridden by payload.context.*)
         ctx = payload.get("context") if isinstance(payload.get("context"), dict) else {}
         specimen_type = str(ctx.get("specimen_type", "serum"))
         age_bucket = str(ctx.get("age_bucket", "adult"))
@@ -188,7 +196,6 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         performing_lab_id = str(ctx.get("performing_lab_id", "LAB_A"))
         policy_version = str(ctx.get("policy_version", "v1"))
 
-        # Extract LOINC from Observation.code (best-effort)
         loinc_code = None
         code_obj = obs_json.get("code") if isinstance(obs_json.get("code"), dict) else {}
         codings = code_obj.get("coding") if isinstance(code_obj.get("coding"), list) else []
@@ -201,7 +208,6 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
                 loinc_code = code
                 break
         if not loinc_code:
-            # fallback: accept first coding code if present
             for c in codings:
                 if isinstance(c, dict) and str(c.get("code", "")).strip():
                     loinc_code = str(c.get("code")).strip()
@@ -209,7 +215,6 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
 
         analyte_code = f"loinc:{loinc_code}" if loinc_code else None
 
-        # Observation time
         observation_time_utc = (
             str(obs_json.get("effectiveDateTime")).strip()
             if str(obs_json.get("effectiveDateTime", "")).strip()
@@ -218,7 +223,6 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         if not observation_time_utc:
             observation_time_utc = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-        # Value & unit from canonical
         value = record.get("result", {}).get("value", None)
         unit = record.get("result", {}).get("unit", None)
 
@@ -233,7 +237,6 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         }
 
         if analyte_code and unit is not None and value is not None:
-            # Load runbook + resolve interval
             runbooks_container = os.getenv("STORAGE_RUNBOOKS_CONTAINER", "runbooks")
             intervals = load_reference_intervals_from_adls(
                 account=account,
@@ -296,6 +299,7 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps(
                 {
                     "status": "ok",
+                    "raw_written_to": f"{raw_container}/{raw_path}",
                     "written_to": f"{canonical_container}/{canonical_file_path}",
                     "derived_written_to": f"{derived_container}/{derived_file_path}",
                     "computed_flag": interpretation["computed_flag"],
@@ -312,6 +316,8 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
             mimetype="application/json",
         )
+
+
 @app.route(route="governance/interval/resolve", methods=["POST"])
 def resolve_interval(req: func.HttpRequest) -> func.HttpResponse:
     try:
