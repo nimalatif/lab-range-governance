@@ -2,12 +2,15 @@ import json
 import os
 import sys
 import re
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 import azure.functions as func
 
+# Make src/ importable on Azure (repo uses src/ layout)
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -46,8 +49,67 @@ def _datalake_client(account: str):
     return DataLakeServiceClient(account_url=url, credential=DefaultAzureCredential())
 
 
+def _request_id(req: func.HttpRequest) -> str:
+    rid = (req.headers.get("x-request-id") or "").strip()
+    return rid if rid else uuid.uuid4().hex
+
+
+def _audit_write(dl, *, container: str, tenant_id: str, request_id: str, event: dict) -> str:
+    fs = dl.get_file_system_client(container)
+    date_path = _utc_path_date()
+    path = f"tenants/{tenant_id}/audit/{date_path}/{request_id}.json"
+    body = json.dumps(event, ensure_ascii=False).encode("utf-8")
+    fs.get_file_client(path).upload_data(body, overwrite=True)
+    return path
+
+
+def _audit_best_effort(
+    *,
+    dl,
+    audit_container: str,
+    tenant_id: str,
+    request_id: str,
+    event: dict,
+) -> str | None:
+    try:
+        if dl and audit_container and tenant_id and request_id:
+            return _audit_write(
+                dl,
+                container=audit_container,
+                tenant_id=tenant_id,
+                request_id=request_id,
+                event=event,
+            )
+    except Exception:
+        pass
+    return None
+
+
+@app.route(route="healthz", methods=["GET"])
+def healthz(req: func.HttpRequest) -> func.HttpResponse:
+    rid = _request_id(req)
+    return func.HttpResponse(
+        json.dumps(
+            {
+                "status": "ok",
+                "request_id": rid,
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            }
+        ),
+        status_code=200,
+        mimetype="application/json",
+    )
+
+
 @app.route(route="ingest/csv", methods=["POST"])
 def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
+    rid = _request_id(req)
+    t0 = time.time()
+
+    dl = None
+    tenant_id = ""
+    audit_container = os.getenv("STORAGE_AUDIT_CONTAINER", "audit")
+
     try:
         from lrg.common.contract import load_contract, validate_record
         from lrg.ingest.csv.row_to_canonical import CsvRow, to_canonical
@@ -221,10 +283,31 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         der_body = json.dumps(derived_record, ensure_ascii=False).encode("utf-8")
         der_file_client.upload_data(der_body, overwrite=True)
 
+        audit_path = _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "ingest/csv",
+                "status": "ok",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "raw_written_to": f"{raw_container}/{raw_path}",
+                "canonical_written_to": f"{canonical_container}/{canonical_file_path}",
+                "derived_written_to": f"{derived_container}/{derived_file_path}",
+                "computed_flag": interpretation.get("computed_flag"),
+                "interval_id": interpretation.get("interval_id"),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
+
         return func.HttpResponse(
             json.dumps(
                 {
                     "status": "ok",
+                    "request_id": rid,
+                    "audit_written_to": f"{audit_container}/{audit_path}" if audit_path else None,
                     "raw_written_to": f"{raw_container}/{raw_path}",
                     "written_to": f"{canonical_container}/{canonical_file_path}",
                     "derived_written_to": f"{derived_container}/{derived_file_path}",
@@ -237,8 +320,22 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "ingest/csv",
+                "status": "error",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "message": str(e),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
+            json.dumps({"status": "error", "request_id": rid, "message": str(e)}),
             status_code=400,
             mimetype="application/json",
         )
@@ -246,6 +343,13 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="ingest/fhir", methods=["POST"])
 def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
+    rid = _request_id(req)
+    t0 = time.time()
+
+    dl = None
+    tenant_id = ""
+    audit_container = os.getenv("STORAGE_AUDIT_CONTAINER", "audit")
+
     try:
         from lrg.common.contract import load_contract, validate_record
         from lrg.ingest.fhir.observation_to_canonical import FhirObservation, to_canonical
@@ -420,10 +524,31 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         der_body = json.dumps(derived_record, ensure_ascii=False).encode("utf-8")
         der_file_client.upload_data(der_body, overwrite=True)
 
+        audit_path = _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "ingest/fhir",
+                "status": "ok",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "raw_written_to": f"{raw_container}/{raw_path}",
+                "canonical_written_to": f"{canonical_container}/{canonical_file_path}",
+                "derived_written_to": f"{derived_container}/{derived_file_path}",
+                "computed_flag": interpretation.get("computed_flag"),
+                "interval_id": interpretation.get("interval_id"),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
+
         return func.HttpResponse(
             json.dumps(
                 {
                     "status": "ok",
+                    "request_id": rid,
+                    "audit_written_to": f"{audit_container}/{audit_path}" if audit_path else None,
                     "raw_written_to": f"{raw_container}/{raw_path}",
                     "written_to": f"{canonical_container}/{canonical_file_path}",
                     "derived_written_to": f"{derived_container}/{derived_file_path}",
@@ -436,8 +561,22 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "ingest/fhir",
+                "status": "error",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "message": str(e),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
+            json.dumps({"status": "error", "request_id": rid, "message": str(e)}),
             status_code=400,
             mimetype="application/json",
         )
@@ -445,6 +584,13 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="governance/interval/resolve", methods=["POST"])
 def resolve_interval(req: func.HttpRequest) -> func.HttpResponse:
+    rid = _request_id(req)
+    t0 = time.time()
+
+    dl = None
+    tenant_id = ""
+    audit_container = os.getenv("STORAGE_AUDIT_CONTAINER", "audit")
+
     try:
         from lrg.governance.runbook_loader import load_reference_intervals_from_adls
         from lrg.governance.reference_intervals import select_interval
@@ -458,8 +604,9 @@ def resolve_interval(req: func.HttpRequest) -> func.HttpResponse:
             raise ValueError("TENANT_ID app setting is required")
 
         account = os.environ["DATALAKE_ACCOUNT"]
-        runbooks_container = os.getenv("STORAGE_RUNBOOKS_CONTAINER", "runbooks")
+        dl = _datalake_client(account)
 
+        runbooks_container = os.getenv("STORAGE_RUNBOOKS_CONTAINER", "runbooks")
         intervals = load_reference_intervals_from_adls(
             account=account,
             container=runbooks_container,
@@ -479,26 +626,78 @@ def resolve_interval(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         if not it:
+            _audit_best_effort(
+                dl=dl,
+                audit_container=audit_container,
+                tenant_id=tenant_id,
+                request_id=rid,
+                event={
+                    "request_id": rid,
+                    "route": "governance/interval/resolve",
+                    "status": "not_found",
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "payload": payload,
+                    "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                },
+            )
             return func.HttpResponse(
-                json.dumps({"status": "not_found"}),
+                json.dumps({"status": "not_found", "request_id": rid}),
                 status_code=404,
                 mimetype="application/json",
             )
 
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "governance/interval/resolve",
+                "status": "ok",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "interval_id": it.interval_id,
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
+
         return func.HttpResponse(
-            json.dumps({"status": "ok", "interval_id": it.interval_id, "range": it.range}),
+            json.dumps({"status": "ok", "request_id": rid, "interval_id": it.interval_id, "range": it.range}),
             status_code=200,
             mimetype="application/json",
         )
 
     except Exception as e:
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "governance/interval/resolve",
+                "status": "error",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "message": str(e),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
+            json.dumps({"status": "error", "request_id": rid, "message": str(e)}),
             status_code=400,
             mimetype="application/json",
         )
+
+
 @app.route(route="query/derived/today", methods=["GET"])
 def query_derived_today(req: func.HttpRequest) -> func.HttpResponse:
+    rid = _request_id(req)
+    t0 = time.time()
+
+    dl = None
+    tenant_id = ""
+    audit_container = os.getenv("STORAGE_AUDIT_CONTAINER", "audit")
+
     try:
         tenant_id = os.getenv("TENANT_ID", "").strip()
         if not tenant_id:
@@ -541,20 +740,58 @@ def query_derived_today(req: func.HttpRequest) -> func.HttpResponse:
                 }
             )
 
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "query/derived/today",
+                "status": "ok",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "count": len(items),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
+
         return func.HttpResponse(
-            json.dumps({"status": "ok", "count": len(items), "items": items}),
+            json.dumps({"status": "ok", "request_id": rid, "count": len(items), "items": items}),
             status_code=200,
             mimetype="application/json",
         )
 
     except Exception as e:
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "query/derived/today",
+                "status": "error",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "message": str(e),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
+            json.dumps({"status": "error", "request_id": rid, "message": str(e)}),
             status_code=400,
             mimetype="application/json",
         )
+
+
 @app.route(route="agent/explain/result", methods=["GET"])
 def agent_explain_result(req: func.HttpRequest) -> func.HttpResponse:
+    rid = _request_id(req)
+    t0 = time.time()
+
+    dl = None
+    tenant_id = ""
+    audit_container = os.getenv("STORAGE_AUDIT_CONTAINER", "audit")
+
     try:
         tenant_id = os.getenv("TENANT_ID", "").strip()
         if not tenant_id:
@@ -586,8 +823,29 @@ def agent_explain_result(req: func.HttpRequest) -> func.HttpResponse:
                 pass
 
         if data is None:
+            _audit_best_effort(
+                dl=dl,
+                audit_container=audit_container,
+                tenant_id=tenant_id,
+                request_id=rid,
+                event={
+                    "request_id": rid,
+                    "route": "agent/explain/result",
+                    "status": "not_found",
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "result_id": result_id,
+                    "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                },
+            )
             return func.HttpResponse(
-                json.dumps({"status": "not_found", "message": "Derived record not found (today)"}),
+                json.dumps(
+                    {
+                        "status": "not_found",
+                        "request_id": rid,
+                        "message": "Derived record not found (today)",
+                        "result_id": result_id,
+                    }
+                ),
                 status_code=404,
                 mimetype="application/json",
             )
@@ -604,20 +862,34 @@ def agent_explain_result(req: func.HttpRequest) -> func.HttpResponse:
             "U": "Unknown (no applicable reference interval found)",
         }.get(flag, "Unknown")
 
-        value = rec.get("value")
-        unit = rec.get("unit")
-        analyte = rec.get("analyte_code")
-        obs_time = rec.get("observation_time_utc")
         ctx = rec.get("context", {}) if isinstance(rec.get("context"), dict) else {}
         src = rec.get("source", {}) if isinstance(rec.get("source"), dict) else {}
 
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "agent/explain/result",
+                "status": "ok",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "result_id": rec.get("result_id"),
+                "computed_flag": flag,
+                "interval_id": interval_id,
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
+
         explanation = {
             "status": "ok",
+            "request_id": rid,
             "result_id": rec.get("result_id"),
-            "analyte_code": analyte,
-            "value": value,
-            "unit": unit,
-            "observation_time_utc": obs_time,
+            "analyte_code": rec.get("analyte_code"),
+            "value": rec.get("value"),
+            "unit": rec.get("unit"),
+            "observation_time_utc": rec.get("observation_time_utc"),
             "computed_flag": flag,
             "computed_flag_meaning": flag_meaning,
             "interval_id": interval_id,
@@ -633,14 +905,36 @@ def agent_explain_result(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "agent/explain/result",
+                "status": "error",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "message": str(e),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
+            json.dumps({"status": "error", "request_id": rid, "message": str(e)}),
             status_code=400,
             mimetype="application/json",
         )
 
+
 @app.route(route="agent/chat", methods=["POST"])
 def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
+    rid = _request_id(req)
+    t0 = time.time()
+
+    dl = None
+    tenant_id = ""
+    audit_container = os.getenv("STORAGE_AUDIT_CONTAINER", "audit")
+
     try:
         payload = req.get_json()
         if not isinstance(payload, dict):
@@ -675,8 +969,30 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
             try:
                 data = fs.get_file_client(p).download_file().readall()
             except Exception:
+                _audit_best_effort(
+                    dl=dl,
+                    audit_container=audit_container,
+                    tenant_id=tenant_id,
+                    request_id=rid,
+                    event={
+                        "request_id": rid,
+                        "route": "agent/chat",
+                        "intent": "explain_result",
+                        "status": "not_found",
+                        "duration_ms": int((time.time() - t0) * 1000),
+                        "result_id": result_id,
+                        "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    },
+                )
                 return func.HttpResponse(
-                    json.dumps({"status": "not_found", "message": "Derived record not found (today)", "result_id": result_id}),
+                    json.dumps(
+                        {
+                            "status": "not_found",
+                            "request_id": rid,
+                            "message": "Derived record not found (today)",
+                            "result_id": result_id,
+                        }
+                    ),
                     status_code=404,
                     mimetype="application/json",
                 )
@@ -691,10 +1007,29 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
                 "U": "Unknown (no applicable reference interval found)",
             }.get(flag, "Unknown")
 
+            _audit_best_effort(
+                dl=dl,
+                audit_container=audit_container,
+                tenant_id=tenant_id,
+                request_id=rid,
+                event={
+                    "request_id": rid,
+                    "route": "agent/chat",
+                    "intent": "explain_result",
+                    "status": "ok",
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "result_id": rec.get("result_id"),
+                    "computed_flag": flag,
+                    "interval_id": interp.get("interval_id"),
+                    "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                },
+            )
+
             return func.HttpResponse(
                 json.dumps(
                     {
                         "status": "ok",
+                        "request_id": rid,
                         "intent": "explain_result",
                         "result_id": rec.get("result_id"),
                         "computed_flag": flag,
@@ -744,16 +1079,48 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
                     }
                 )
 
+            _audit_best_effort(
+                dl=dl,
+                audit_container=audit_container,
+                tenant_id=tenant_id,
+                request_id=rid,
+                event={
+                    "request_id": rid,
+                    "route": "agent/chat",
+                    "intent": "list_today",
+                    "status": "ok",
+                    "duration_ms": int((time.time() - t0) * 1000),
+                    "count": len(items),
+                    "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                },
+            )
+
             return func.HttpResponse(
-                json.dumps({"status": "ok", "intent": "list_today", "count": len(items), "items": items}),
+                json.dumps({"status": "ok", "request_id": rid, "intent": "list_today", "count": len(items), "items": items}),
                 status_code=200,
                 mimetype="application/json",
             )
+
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "agent/chat",
+                "intent": "help",
+                "status": "ok",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
 
         return func.HttpResponse(
             json.dumps(
                 {
                     "status": "ok",
+                    "request_id": rid,
                     "intent": "help",
                     "message": "Try: 'list today' OR 'explain R1002'.",
                     "available": [
@@ -768,8 +1135,22 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     except Exception as e:
+        _audit_best_effort(
+            dl=dl,
+            audit_container=audit_container,
+            tenant_id=tenant_id,
+            request_id=rid,
+            event={
+                "request_id": rid,
+                "route": "agent/chat",
+                "status": "error",
+                "duration_ms": int((time.time() - t0) * 1000),
+                "message": str(e),
+                "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            },
+        )
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
+            json.dumps({"status": "error", "request_id": rid, "message": str(e)}),
             status_code=400,
             mimetype="application/json",
         )
