@@ -147,3 +147,57 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
             mimetype="application/json",
         )
+@app.route(route="governance/interval/resolve", methods=["POST"])
+def resolve_interval(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from lrg.governance.runbook_loader import load_reference_intervals_from_adls
+        from lrg.governance.reference_intervals import select_interval
+
+        payload = req.get_json()
+        if not isinstance(payload, dict):
+            raise ValueError("Body must be a JSON object")
+
+        tenant_id = os.getenv("TENANT_ID", "").strip()
+        if not tenant_id:
+            raise ValueError("TENANT_ID app setting is required")
+
+        account = os.environ["DATALAKE_ACCOUNT"]
+        runbooks_container = os.getenv("STORAGE_RUNBOOKS_CONTAINER", "runbooks")
+
+        intervals = load_reference_intervals_from_adls(
+            account=account,
+            container=runbooks_container,
+            tenant_id=tenant_id,
+        )
+
+        it = select_interval(
+            intervals,
+            analyte_code=str(payload["analyte_code"]),
+            unit=str(payload["unit"]),
+            specimen_type=str(payload["specimen_type"]),
+            age_bucket=str(payload["age_bucket"]),
+            sex=str(payload["sex"]),
+            performing_lab_id=str(payload["performing_lab_id"]),
+            policy_version=str(payload["policy_version"]),
+            observation_time_utc=str(payload["observation_time_utc"]),
+        )
+
+        if not it:
+            return func.HttpResponse(
+                json.dumps({"status": "not_found"}),
+                status_code=404,
+                mimetype="application/json",
+            )
+
+        return func.HttpResponse(
+            json.dumps({"status": "ok", "interval_id": it.interval_id, "range": it.range}),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=400,
+            mimetype="application/json",
+        )
