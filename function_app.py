@@ -93,8 +93,12 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="ingest/fhir", methods=["POST"])
 def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        from datetime import datetime, timezone
+
         from lrg.common.contract import load_contract, validate_record
         from lrg.ingest.fhir.observation_to_canonical import FhirObservation, to_canonical
+        from lrg.governance.runbook_loader import load_reference_intervals_from_adls
+        from lrg.governance.reference_intervals import select_interval
 
         payload = req.get_json()
         if not isinstance(payload, dict):
@@ -110,33 +114,156 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         if not isinstance(obs_json, dict):
             raise ValueError("Missing 'observation' object (FHIR Observation JSON)")
 
+        # Canonicalize (contract-bound)
         obs = FhirObservation(
             tenant_id=tenant_id,
             source_system_id=source_system_id,
             observation_json=obs_json
         )
-
-        record: Dict[str, Any] = to_canonical(obs, environment=env, rules_version="v1", mapping_version="v1")
+        record: Dict[str, Any] = to_canonical(
+            obs, environment=env, rules_version="v1", mapping_version="v1"
+        )
 
         validator = load_contract(Path(__file__).resolve().parent)
         validate_record(validator, record)
 
+        # Write canonical
         account = os.environ["DATALAKE_ACCOUNT"]
-        container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
+        canonical_container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
 
         dl = _datalake_client(account)
-        fs = dl.get_file_system_client(container)
+        fs_canon = dl.get_file_system_client(canonical_container)
 
         date_path = _utc_path_date()
         tenant_prefix = f"tenants/{tenant_id}/lab_results/{date_path}"
-        file_path = f"{tenant_prefix}/{record['result']['result_id']}.json"
+        canonical_file_path = f"{tenant_prefix}/{record['result']['result_id']}.json"
 
-        file_client = fs.get_file_client(file_path)
-        body = json.dumps(record, ensure_ascii=False).encode("utf-8")
-        file_client.upload_data(body, overwrite=True)
+        canon_file_client = fs_canon.get_file_client(canonical_file_path)
+        canon_body = json.dumps(record, ensure_ascii=False).encode("utf-8")
+        canon_file_client.upload_data(canon_body, overwrite=True)
+
+        # --- Derived interpretation (semantic / AI-ready layer) ---
+        # Defaults (can be overridden by payload.context.*)
+        ctx = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        specimen_type = str(ctx.get("specimen_type", "serum"))
+        age_bucket = str(ctx.get("age_bucket", "adult"))
+        sex = str(ctx.get("sex", "male"))
+        performing_lab_id = str(ctx.get("performing_lab_id", "LAB_A"))
+        policy_version = str(ctx.get("policy_version", "v1"))
+
+        # Extract LOINC from Observation.code (best-effort)
+        loinc_code = None
+        code_obj = obs_json.get("code") if isinstance(obs_json.get("code"), dict) else {}
+        codings = code_obj.get("coding") if isinstance(code_obj.get("coding"), list) else []
+        for c in codings:
+            if not isinstance(c, dict):
+                continue
+            system = str(c.get("system", "")).strip()
+            code = str(c.get("code", "")).strip()
+            if code and (system == "http://loinc.org" or system.endswith("/loinc")):
+                loinc_code = code
+                break
+        if not loinc_code:
+            # fallback: accept first coding code if present
+            for c in codings:
+                if isinstance(c, dict) and str(c.get("code", "")).strip():
+                    loinc_code = str(c.get("code")).strip()
+                    break
+
+        analyte_code = f"loinc:{loinc_code}" if loinc_code else None
+
+        # Observation time
+        observation_time_utc = (
+            str(obs_json.get("effectiveDateTime")).strip()
+            if str(obs_json.get("effectiveDateTime", "")).strip()
+            else str(record.get("result", {}).get("timestamp_iso", "")).strip()
+        )
+        if not observation_time_utc:
+            observation_time_utc = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        # Value & unit from canonical
+        value = record.get("result", {}).get("value", None)
+        unit = record.get("result", {}).get("unit", None)
+
+        derived_container = os.getenv("STORAGE_DERIVED_CONTAINER", "derived")
+        fs_derived = dl.get_file_system_client(derived_container)
+
+        interpretation = {
+            "computed_flag": "U",
+            "interval_id": None,
+            "computed_by": "lrg.governance.v1",
+            "computed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+
+        if analyte_code and unit is not None and value is not None:
+            # Load runbook + resolve interval
+            runbooks_container = os.getenv("STORAGE_RUNBOOKS_CONTAINER", "runbooks")
+            intervals = load_reference_intervals_from_adls(
+                account=account,
+                container=runbooks_container,
+                tenant_id=tenant_id,
+            )
+
+            it = select_interval(
+                intervals,
+                analyte_code=str(analyte_code),
+                unit=str(unit),
+                specimen_type=str(specimen_type),
+                age_bucket=str(age_bucket),
+                sex=str(sex),
+                performing_lab_id=str(performing_lab_id),
+                policy_version=str(policy_version),
+                observation_time_utc=str(observation_time_utc),
+            )
+
+            if it and isinstance(it.range, dict) and it.range.get("type") == "numeric":
+                low = it.range.get("low")
+                high = it.range.get("high")
+                if isinstance(low, (int, float)) and isinstance(high, (int, float)) and isinstance(value, (int, float)):
+                    if value < low:
+                        interpretation["computed_flag"] = "L"
+                    elif value > high:
+                        interpretation["computed_flag"] = "H"
+                    else:
+                        interpretation["computed_flag"] = "N"
+                    interpretation["interval_id"] = it.interval_id
+
+        derived_record = {
+            "tenant_id": tenant_id,
+            "result_id": record["result"]["result_id"],
+            "analyte_code": analyte_code,
+            "unit": unit,
+            "value": value,
+            "observation_time_utc": observation_time_utc,
+            "context": {
+                "specimen_type": specimen_type,
+                "age_bucket": age_bucket,
+                "sex": sex,
+                "performing_lab_id": performing_lab_id,
+                "policy_version": policy_version,
+            },
+            "interpretation": interpretation,
+            "source": {
+                "canonical_path": f"{canonical_container}/{canonical_file_path}",
+            },
+        }
+
+        derived_prefix = f"tenants/{tenant_id}/lab_results_interpreted/{date_path}"
+        derived_file_path = f"{derived_prefix}/{record['result']['result_id']}.json"
+        der_file_client = fs_derived.get_file_client(derived_file_path)
+        der_body = json.dumps(derived_record, ensure_ascii=False).encode("utf-8")
+        der_file_client.upload_data(der_body, overwrite=True)
 
         return func.HttpResponse(
-            json.dumps({"status": "ok", "written_to": f"{container}/{file_path}"}),
+            json.dumps(
+                {
+                    "status": "ok",
+                    "written_to": f"{canonical_container}/{canonical_file_path}",
+                    "derived_written_to": f"{derived_container}/{derived_file_path}",
+                    "computed_flag": interpretation["computed_flag"],
+                    "interval_id": interpretation["interval_id"],
+                }
+            ),
             status_code=200,
             mimetype="application/json",
         )
