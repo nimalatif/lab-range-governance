@@ -552,3 +552,88 @@ def query_derived_today(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
             mimetype="application/json",
         )
+@app.route(route="agent/explain/result", methods=["GET"])
+def agent_explain_result(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        tenant_id = os.getenv("TENANT_ID", "").strip()
+        if not tenant_id:
+            raise ValueError("TENANT_ID app setting is required")
+
+        result_id = (req.params.get("result_id") or "").strip()
+        if not result_id:
+            raise ValueError("result_id query param is required")
+
+        account = os.environ["DATALAKE_ACCOUNT"]
+        derived_container = os.getenv("STORAGE_DERIVED_CONTAINER", "derived")
+        dl = _datalake_client(account)
+        fs = dl.get_file_system_client(derived_container)
+
+        # search today first (fast path)
+        date_path = _utc_path_date()
+        candidates = [
+            f"tenants/{tenant_id}/lab_results_interpreted/{date_path}/{result_id}.json",
+        ]
+
+        data = None
+        found_path = None
+        for p in candidates:
+            try:
+                data = fs.get_file_client(p).download_file().readall()
+                found_path = p
+                break
+            except Exception:
+                pass
+
+        if data is None:
+            return func.HttpResponse(
+                json.dumps({"status": "not_found", "message": "Derived record not found (today)"}),
+                status_code=404,
+                mimetype="application/json",
+            )
+
+        rec = json.loads(data)
+        interp = rec.get("interpretation", {}) if isinstance(rec.get("interpretation"), dict) else {}
+        flag = interp.get("computed_flag", "U")
+        interval_id = interp.get("interval_id")
+
+        flag_meaning = {
+            "L": "Low (below reference range)",
+            "N": "Normal (within reference range)",
+            "H": "High (above reference range)",
+            "U": "Unknown (no applicable reference interval found)",
+        }.get(flag, "Unknown")
+
+        value = rec.get("value")
+        unit = rec.get("unit")
+        analyte = rec.get("analyte_code")
+        obs_time = rec.get("observation_time_utc")
+        ctx = rec.get("context", {}) if isinstance(rec.get("context"), dict) else {}
+        src = rec.get("source", {}) if isinstance(rec.get("source"), dict) else {}
+
+        explanation = {
+            "status": "ok",
+            "result_id": rec.get("result_id"),
+            "analyte_code": analyte,
+            "value": value,
+            "unit": unit,
+            "observation_time_utc": obs_time,
+            "computed_flag": flag,
+            "computed_flag_meaning": flag_meaning,
+            "interval_id": interval_id,
+            "context": ctx,
+            "source_paths": src,
+            "derived_path": f"{derived_container}/{found_path}",
+        }
+
+        return func.HttpResponse(
+            json.dumps(explanation),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=400,
+            mimetype="application/json",
+        )
