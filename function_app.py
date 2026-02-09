@@ -17,6 +17,16 @@ def _utc_path_date() -> str:
     now = datetime.now(timezone.utc)
     return f"{now.year:04d}/{now.month:02d}/{now.day:02d}"
 
+def _write_raw_event(dl, *, container: str, tenant_id: str, event_id: str, payload: dict, event_type: str) -> str:
+    fs = dl.get_file_system_client(container)
+    date_path = _utc_path_date()
+    file_path = f"tenants/{tenant_id}/ingest_events/{date_path}/{event_id}.json"
+    body = json.dumps(
+        {"event_type": event_type, "payload": payload},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    fs.get_file_client(file_path).upload_data(body, overwrite=True)
+    return file_path
 
 def _datalake_client(account: str):
     from azure.identity import DefaultAzureCredential
@@ -68,6 +78,16 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
 
         dl = _datalake_client(account)
+        raw_container = os.getenv("STORAGE_RAW_CONTAINER", "raw")
+        raw_path = _write_raw_event(
+            dl,
+            container=raw_container,
+            tenant_id=tenant_id,
+            event_id=record["result"]["result_id"],
+            payload=payload,
+            event_type="ingest_csv",
+        )
+
         fs = dl.get_file_system_client(container)
 
         date_path = _utc_path_date()
@@ -79,10 +99,17 @@ def ingest_csv(req: func.HttpRequest) -> func.HttpResponse:
         file_client.upload_data(body, overwrite=True)
 
         return func.HttpResponse(
-            json.dumps({"status": "ok", "written_to": f"{container}/{file_path}"}),
+            json.dumps(
+                {
+                    "status": "ok",
+                    "raw_written_to": f"{raw_container}/{raw_path}",
+                    "written_to": f"{container}/{file_path}",
+                }
+            ),
             status_code=200,
             mimetype="application/json",
         )
+
 
     except Exception as e:
         return func.HttpResponse(
@@ -132,6 +159,16 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
         canonical_container = os.getenv("STORAGE_CANONICAL_CONTAINER", "canonical")
 
         dl = _datalake_client(account)
+        raw_container = os.getenv("STORAGE_RAW_CONTAINER", "raw")
+        raw_path = _write_raw_event(
+            dl,
+            container=raw_container,
+            tenant_id=tenant_id,
+            event_id=record["result"]["result_id"],
+            payload=payload,
+            event_type="ingest_fhir",
+            )
+
         fs_canon = dl.get_file_system_client(canonical_container)
 
         date_path = _utc_path_date()
@@ -244,6 +281,7 @@ def ingest_fhir(req: func.HttpRequest) -> func.HttpResponse:
             },
             "interpretation": interpretation,
             "source": {
+                "raw_path": f"{raw_container}/{raw_path}",
                 "canonical_path": f"{canonical_container}/{canonical_file_path}",
             },
         }
