@@ -496,3 +496,59 @@ def resolve_interval(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
             mimetype="application/json",
         )
+@app.route(route="query/derived/today", methods=["GET"])
+def query_derived_today(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        tenant_id = os.getenv("TENANT_ID", "").strip()
+        if not tenant_id:
+            raise ValueError("TENANT_ID app setting is required")
+
+        account = os.environ["DATALAKE_ACCOUNT"]
+        derived_container = os.getenv("STORAGE_DERIVED_CONTAINER", "derived")
+        dl = _datalake_client(account)
+        fs = dl.get_file_system_client(derived_container)
+
+        date_path = _utc_path_date()
+        prefix = f"tenants/{tenant_id}/lab_results_interpreted/{date_path}/"
+
+        limit_raw = req.params.get("limit", "25")
+        limit = int(limit_raw) if str(limit_raw).isdigit() else 25
+
+        names = []
+        for p in fs.get_paths(path=prefix):
+            if getattr(p, "is_directory", False):
+                continue
+            names.append(p.name)
+
+        names = sorted(names, reverse=True)[:limit]
+
+        items = []
+        for name in names:
+            data = fs.get_file_client(name).download_file().readall()
+            rec = json.loads(data)
+            interp = rec.get("interpretation", {}) if isinstance(rec.get("interpretation"), dict) else {}
+            items.append(
+                {
+                    "path": f"{derived_container}/{name}",
+                    "result_id": rec.get("result_id"),
+                    "analyte_code": rec.get("analyte_code"),
+                    "value": rec.get("value"),
+                    "unit": rec.get("unit"),
+                    "observation_time_utc": rec.get("observation_time_utc"),
+                    "computed_flag": interp.get("computed_flag"),
+                    "interval_id": interp.get("interval_id"),
+                }
+            )
+
+        return func.HttpResponse(
+            json.dumps({"status": "ok", "count": len(items), "items": items}),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=400,
+            mimetype="application/json",
+        )
