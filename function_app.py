@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
@@ -627,6 +628,141 @@ def agent_explain_result(req: func.HttpRequest) -> func.HttpResponse:
 
         return func.HttpResponse(
             json.dumps(explanation),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"status": "error", "message": str(e)}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+@app.route(route="agent/chat", methods=["POST"])
+def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        payload = req.get_json()
+        if not isinstance(payload, dict):
+            raise ValueError("Body must be a JSON object")
+
+        message = str(payload.get("message", "")).strip()
+        if not message:
+            raise ValueError("message is required")
+
+        msg = message.lower()
+        limit_raw = str(payload.get("limit", "25"))
+        limit = int(limit_raw) if limit_raw.isdigit() else 25
+        limit = max(1, min(limit, 200))
+
+        tenant_id = os.getenv("TENANT_ID", "").strip()
+        if not tenant_id:
+            raise ValueError("TENANT_ID app setting is required")
+
+        account = os.environ["DATALAKE_ACCOUNT"]
+        derived_container = os.getenv("STORAGE_DERIVED_CONTAINER", "derived")
+        dl = _datalake_client(account)
+        fs = dl.get_file_system_client(derived_container)
+
+        # Try to detect a result_id in the message (R1002, obs-glu-002, etc.)
+        m = re.search(r"\b(R\d{3,}|obs-[a-z0-9-]+)\b", message, flags=re.IGNORECASE)
+        result_id = m.group(1) if m else ""
+
+        # Intent 1: explain a specific result
+        if result_id and ("explain" in msg or "why" in msg or "meaning" in msg or "what" in msg):
+            date_path = _utc_path_date()
+            p = f"tenants/{tenant_id}/lab_results_interpreted/{date_path}/{result_id}.json"
+            try:
+                data = fs.get_file_client(p).download_file().readall()
+            except Exception:
+                return func.HttpResponse(
+                    json.dumps({"status": "not_found", "message": "Derived record not found (today)", "result_id": result_id}),
+                    status_code=404,
+                    mimetype="application/json",
+                )
+
+            rec = json.loads(data)
+            interp = rec.get("interpretation", {}) if isinstance(rec.get("interpretation"), dict) else {}
+            flag = interp.get("computed_flag", "U")
+            flag_meaning = {
+                "L": "Low (below reference range)",
+                "N": "Normal (within reference range)",
+                "H": "High (above reference range)",
+                "U": "Unknown (no applicable reference interval found)",
+            }.get(flag, "Unknown")
+
+            return func.HttpResponse(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "intent": "explain_result",
+                        "result_id": rec.get("result_id"),
+                        "computed_flag": flag,
+                        "computed_flag_meaning": flag_meaning,
+                        "interval_id": interp.get("interval_id"),
+                        "analyte_code": rec.get("analyte_code"),
+                        "value": rec.get("value"),
+                        "unit": rec.get("unit"),
+                        "observation_time_utc": rec.get("observation_time_utc"),
+                        "context": rec.get("context", {}),
+                        "source_paths": rec.get("source", {}),
+                        "derived_path": f"{derived_container}/{p}",
+                    }
+                ),
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        # Intent 2: list today's derived
+        if ("today" in msg) or ("list" in msg) or ("show" in msg):
+            date_path = _utc_path_date()
+            prefix = f"tenants/{tenant_id}/lab_results_interpreted/{date_path}/"
+
+            names = []
+            for p in fs.get_paths(path=prefix):
+                if getattr(p, "is_directory", False):
+                    continue
+                names.append(p.name)
+
+            names = sorted(names, reverse=True)[:limit]
+
+            items = []
+            for name in names:
+                data = fs.get_file_client(name).download_file().readall()
+                rec = json.loads(data)
+                interp = rec.get("interpretation", {}) if isinstance(rec.get("interpretation"), dict) else {}
+                items.append(
+                    {
+                        "path": f"{derived_container}/{name}",
+                        "result_id": rec.get("result_id"),
+                        "analyte_code": rec.get("analyte_code"),
+                        "value": rec.get("value"),
+                        "unit": rec.get("unit"),
+                        "observation_time_utc": rec.get("observation_time_utc"),
+                        "computed_flag": interp.get("computed_flag"),
+                        "interval_id": interp.get("interval_id"),
+                    }
+                )
+
+            return func.HttpResponse(
+                json.dumps({"status": "ok", "intent": "list_today", "count": len(items), "items": items}),
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "intent": "help",
+                    "message": "Try: 'list today' OR 'explain R1002'.",
+                    "available": [
+                        "GET /api/query/derived/today",
+                        "GET /api/agent/explain/result?result_id=R1002",
+                        "POST /api/agent/chat  {\"message\":\"list today\"}",
+                    ],
+                }
+            ),
             status_code=200,
             mimetype="application/json",
         )
