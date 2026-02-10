@@ -958,7 +958,7 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
         fs = dl.get_file_system_client(derived_container)
 
         # Try to detect a result_id in the message (R1002, obs-glu-002, etc.)
-        m = re.search(r"\b(R\d{3,}|obs-[a-z0-9-]+)\b", message, flags=re.IGNORECASE)
+        m = re.search(r"\b(R[0-9A-Za-z_][0-9A-Za-z_-]{2,}|obs-[a-z0-9-]+)\b", message, flags=re.IGNORECASE)
         result_id = m.group(1) if m else ""
 
         # ---------- LLM router (safe; falls back automatically) ----------
