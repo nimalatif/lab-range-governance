@@ -212,3 +212,4 @@ local.settings.json
 __pycache__/
 *.pyc
 
+lifecycle-dev.json
