@@ -6,12 +6,12 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
-
-import azure.functions as func
+from typing import Any, Dict, Optional
 
 # Make src/ importable on Azure (repo uses src/ layout)
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+import azure.functions as func
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -70,7 +70,7 @@ def _audit_best_effort(
     tenant_id: str,
     request_id: str,
     event: dict,
-) -> str | None:
+) -> Optional[str]:
     try:
         if dl and audit_container and tenant_id and request_id:
             return _audit_write(
@@ -806,7 +806,6 @@ def agent_explain_result(req: func.HttpRequest) -> func.HttpResponse:
         dl = _datalake_client(account)
         fs = dl.get_file_system_client(derived_container)
 
-        # search today first (fast path)
         date_path = _utc_path_date()
         candidates = [
             f"tenants/{tenant_id}/lab_results_interpreted/{date_path}/{result_id}.json",
@@ -962,8 +961,72 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
         m = re.search(r"\b(R\d{3,}|obs-[a-z0-9-]+)\b", message, flags=re.IGNORECASE)
         result_id = m.group(1) if m else ""
 
+        # ---------- LLM router (safe; falls back automatically) ----------
+        intent_override = None
+        routed_by = "rules"
+
+        try:
+            from lrg.agent.llm_router import route_intent
+
+            routed = route_intent(message, default_limit=limit)
+            if isinstance(routed, dict) and isinstance(routed.get("intent"), str):
+                intent_override = routed["intent"]
+                routed_by = "llm"
+
+                if intent_override == "list_today":
+                    lim = routed.get("limit", limit)
+                    if not isinstance(lim, int):
+                        lim = limit
+                    limit = max(1, min(lim, 200))
+
+                elif intent_override == "explain_result":
+                    rid2 = routed.get("result_id")
+                    if isinstance(rid2, str) and rid2.strip():
+                        result_id = rid2.strip()
+                    else:
+                        intent_override = "help"
+
+                elif intent_override == "help":
+                    _audit_best_effort(
+                        dl=dl,
+                        audit_container=audit_container,
+                        tenant_id=tenant_id,
+                        request_id=rid,
+                        event={
+                            "request_id": rid,
+                            "route": "agent/chat",
+                            "intent": "help",
+                            "status": "ok",
+                            "router": routed_by,
+                            "duration_ms": int((time.time() - t0) * 1000),
+                            "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                        },
+                    )
+                    return func.HttpResponse(
+                        json.dumps(
+                            {
+                                "status": "ok",
+                                "request_id": rid,
+                                "intent": "help",
+                                "message": "Try: 'list today' OR 'explain R1002'.",
+                                "available": [
+                                    "GET /api/query/derived/today",
+                                    "GET /api/agent/explain/result?result_id=R1002",
+                                    "POST /api/agent/chat  {\"message\":\"list today\"}",
+                                ],
+                            }
+                        ),
+                        status_code=200,
+                        mimetype="application/json",
+                    )
+        except Exception:
+            intent_override = None
+            routed_by = "rules"
+        # ---------------------------------------------------------------
+
         # Intent 1: explain a specific result
-        if result_id and ("explain" in msg or "why" in msg or "meaning" in msg or "what" in msg):
+        explain_keywords = ("explain" in msg or "why" in msg or "meaning" in msg or "what" in msg)
+        if (intent_override == "explain_result") or (result_id and explain_keywords):
             date_path = _utc_path_date()
             p = f"tenants/{tenant_id}/lab_results_interpreted/{date_path}/{result_id}.json"
             try:
@@ -979,6 +1042,7 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
                         "route": "agent/chat",
                         "intent": "explain_result",
                         "status": "not_found",
+                        "router": routed_by,
                         "duration_ms": int((time.time() - t0) * 1000),
                         "result_id": result_id,
                         "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -1017,6 +1081,7 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
                     "route": "agent/chat",
                     "intent": "explain_result",
                     "status": "ok",
+                    "router": routed_by,
                     "duration_ms": int((time.time() - t0) * 1000),
                     "result_id": rec.get("result_id"),
                     "computed_flag": flag,
@@ -1049,7 +1114,7 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         # Intent 2: list today's derived
-        if ("today" in msg) or ("list" in msg) or ("show" in msg):
+        if (intent_override == "list_today") or ("today" in msg) or ("list" in msg) or ("show" in msg):
             date_path = _utc_path_date()
             prefix = f"tenants/{tenant_id}/lab_results_interpreted/{date_path}/"
 
@@ -1089,6 +1154,7 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
                     "route": "agent/chat",
                     "intent": "list_today",
                     "status": "ok",
+                    "router": routed_by,
                     "duration_ms": int((time.time() - t0) * 1000),
                     "count": len(items),
                     "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -1096,7 +1162,15 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
             )
 
             return func.HttpResponse(
-                json.dumps({"status": "ok", "request_id": rid, "intent": "list_today", "count": len(items), "items": items}),
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "request_id": rid,
+                        "intent": "list_today",
+                        "count": len(items),
+                        "items": items,
+                    }
+                ),
                 status_code=200,
                 mimetype="application/json",
             )
@@ -1111,6 +1185,7 @@ def agent_chat(req: func.HttpRequest) -> func.HttpResponse:
                 "route": "agent/chat",
                 "intent": "help",
                 "status": "ok",
+                "router": routed_by,
                 "duration_ms": int((time.time() - t0) * 1000),
                 "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             },
